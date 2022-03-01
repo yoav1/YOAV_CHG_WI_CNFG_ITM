@@ -1,0 +1,298 @@
+*&---------------------------------------------------------------------*
+*&  Include           YOAV_CHG_WI_CNFG_ITM_LCI
+*&---------------------------------------------------------------------*
+
+CLASS lcl_app IMPLEMENTATION.
+
+  METHOD get_instance.
+
+    IF go_instance IS INITIAL.
+      CREATE OBJECT go_instance.
+    ENDIF.
+
+    ro_instance = go_instance.
+
+  ENDMETHOD.
+
+  METHOD main.
+
+
+*--------------------------------------------------------------------*
+* Fetch all FB entities relevant for update
+*--------------------------------------------------------------------*
+
+    DATA lr_final_stat TYPE RANGE OF tj30t-txt30.
+    GET TIME STAMP FIELD DATA(lv_curr_tmstmp).
+
+    SELECT DISTINCT tj30t~txt30 AS low
+      FROM tj30
+      JOIN tj30t
+        ON tj30t~stsma = tj30~stsma
+       AND tj30t~estat = tj30~estat
+       AND tj30t~spras = 'E' "English
+      WHERE tj30~stsma LIKE 'S1%'            "all FB transaction types
+        AND tj30~stsma NOT IN ( 'S1IRHEAD'   "except: Change Req. for Work Package
+                               ,'S1TKHEAD' ) "   and: FB Task
+        AND tj30~crm_vrgng = 'FINI'          "with final status
+    INTO CORRESPONDING FIELDS OF TABLE @lr_final_stat.
+
+    MODIFY lr_final_stat FROM VALUE #( sign = 'I' option = 'EQ' ) TRANSPORTING sign option WHERE sign IS INITIAL.
+
+* Get all relevant Work Items
+    SELECT DISTINCT
+           zfbc_wi~wi_id   AS fb_id
+          ,zfbc_wi~wi_guid AS fb_guid
+          ,zfbc_wi~process_type
+          ,crmd_link~guid_set
+          ,crmd_srv_refobj~product_id
+          ,comm_product~product_guid
+          ,comm_product~xnosearch
+          ,comm_prshtext~short_text
+      FROM zfbc_wi
+      JOIN crmd_link
+        ON crmd_link~guid_hi           = zfbc_wi~wi_guid
+      JOIN crmd_srv_osset
+        ON crmd_srv_osset~guid_set     = crmd_link~guid_set
+      JOIN crmd_srv_refobj
+        ON crmd_srv_refobj~guid_ref    = crmd_srv_osset~guid
+       AND crmd_srv_refobj~main_object = 'X'
+      JOIN comm_product
+        ON comm_product~product_guid   = crmd_srv_refobj~guid_object
+      JOIN comm_prshtext
+        ON comm_prshtext~product_guid  = comm_product~product_guid
+      WHERE zfbc_wi~wi_id IN @s_id
+        AND zfbc_wi~wi_stat_desc NOT IN @lr_final_stat
+        AND comm_product~xnosearch     = 'X'
+
+* and all relevant Work Packages
+   UNION ALL SELECT DISTINCT
+           zfbc_wp~wp_id   AS fb_id
+          ,zfbc_wp~wp_guid AS fb_guid
+          ,zfbc_wp~process_type
+          ,crmd_link~guid_set
+          ,crmd_srv_refobj~product_id
+          ,comm_product~product_guid
+          ,comm_product~xnosearch
+          ,comm_prshtext~short_text
+      FROM zfbc_wp
+      JOIN crmd_link
+        ON crmd_link~guid_hi           = zfbc_wp~wp_guid
+      JOIN crmd_srv_osset
+        ON crmd_srv_osset~guid_set     = crmd_link~guid_set
+      JOIN crmd_srv_refobj
+        ON crmd_srv_refobj~guid_ref    = crmd_srv_osset~guid
+       AND crmd_srv_refobj~main_object = 'X'
+      JOIN comm_product
+        ON comm_product~product_guid   = crmd_srv_refobj~guid_object
+      JOIN comm_prshtext
+        ON comm_prshtext~product_guid  = comm_product~product_guid
+      WHERE zfbc_wp~wp_id IN @s_id
+        AND zfbc_wp~wp_stat_desc NOT IN @lr_final_stat
+        AND comm_product~xnosearch     = 'X'
+      INTO TABLE @DATA(lt_fb).
+
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+
+* Get current config items for archived productd
+    SELECT DISTINCT
+           comm_product~product_id
+          ,comm_product~product_guid
+          ,comm_prshtext~short_text
+          ,ibin~instance
+          ,ibin~in_guid
+      FROM comm_prshtext
+      JOIN comm_product
+        ON comm_product~product_guid = comm_prshtext~product_guid
+      LEFT JOIN ibin "Join not possible, this is just to add fields
+        ON ibin~in_guid = comm_product~product_guid
+      FOR ALL ENTRIES IN @lt_fb
+      WHERE comm_prshtext~short_text    = @lt_fb-short_text
+        AND comm_prshtext~product_guid <> @lt_fb-product_guid
+        AND comm_product~xnosearch      = @space
+      INTO TABLE @DATA(lt_new_cnfg_itm).
+
+
+* Map all fields to be updated
+    DATA(lt_input_field_names) = VALUE crmt_input_field_names_tab(
+      ( fieldname = 'GUID_OBJECT')
+      ( fieldname = 'PRODUCT_ID')
+      ( fieldname = 'IB_COMP_REF_GUID')
+*    ( fieldname = 'IB_COMP_VALID')
+      ( fieldname = 'TEXT_OBJECT')
+      ( fieldname = 'IB_INSTANCE')
+    ).
+
+
+*--------------------------------------------------------------------*
+* update found FB entities
+*--------------------------------------------------------------------*
+    DATA lt_objects_to_save TYPE crmt_object_guid_tab.
+
+* Go over all relevant Work Items
+    LOOP AT lt_fb ASSIGNING FIELD-SYMBOL(<ls_fb>).
+
+*   Get new configuration item
+      READ TABLE lt_new_cnfg_itm
+        WITH KEY short_text = <ls_fb>-short_text
+        ASSIGNING FIELD-SYMBOL(<ls_refobj_new>).
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+
+      IF <ls_refobj_new>-instance IS INITIAL.
+        TRY.
+            cl_system_uuid=>convert_uuid_x16_static(
+              EXPORTING
+                uuid     = <ls_refobj_new>-product_guid
+              IMPORTING
+                uuid_c22 = DATA(lv_objnr) ).
+          CATCH cx_uuid_error.
+        ENDTRY.
+
+        SELECT SINGLE instance ,in_guid
+          FROM ibin
+            WHERE objnr  = @lv_objnr
+            AND   valfr <= @lv_curr_tmstmp
+            AND   valto >= @lv_curr_tmstmp
+          INTO ( @<ls_refobj_new>-instance, @<ls_refobj_new>-in_guid ).
+      ENDIF.
+
+
+* read old values from API
+      DATA(lt_refobj_old) = VALUE crmt_refobj_wrkt( ).
+      CALL FUNCTION 'CRM_REFOBJ_READ_OW'
+        EXPORTING
+          iv_ref_guid    = <ls_fb>-fb_guid
+          iv_ref_kind    = 'A'
+        IMPORTING
+          et_refobj_wrk  = lt_refobj_old
+        EXCEPTIONS
+          error_occurred = 1
+          OTHERS         = 2.
+
+*   Go over Reference Objects of current Focused Build entity
+      LOOP AT lt_refobj_old ASSIGNING FIELD-SYMBOL(<ls_refobj_old>)
+        WHERE main_object = abap_true
+          AND product_id  = <ls_fb>-product_id.
+
+*     If FB entity is a work package, update its scope items
+        CASE <ls_fb>-process_type.
+          WHEN 'S1IT'  "Work Package
+            OR 'S1CR'. "Request for Change
+            DATA(lo_fb) = NEW /salm/cl_crmui5_service_data( ).
+            lo_fb->/salm/if_work_package_manager~get_wp_scope(
+              EXPORTING
+                iv_wp_guid     = <ls_fb>-fb_guid
+              IMPORTING
+                et_scope       = DATA(lt_scope) ).
+            LOOP AT lt_scope ASSIGNING FIELD-SYMBOL(<ls_scope>).
+              <ls_scope>-ibase_instance	= <ls_refobj_new>-instance.   "ls_refobj_new-ib_instance.
+              <ls_scope>-config_item    = <ls_refobj_new>-product_id. "ls_refobj_new-product_id.
+              <ls_scope>-cmp_desc       = <ls_refobj_new>-short_text. "ls_refobj_new-text_object.
+              lo_fb->/salm/if_work_package_manager~change_scope_item( <ls_scope> ).
+            ENDLOOP.
+        ENDCASE.
+
+*     Prepare to update FB entity
+        <ls_refobj_old>-guid_object      = <ls_refobj_new>-product_guid.
+        <ls_refobj_old>-product_id       = <ls_refobj_new>-product_id.
+        <ls_refobj_old>-ib_comp_ref_guid = <ls_refobj_new>-in_guid.
+        <ls_refobj_old>-text_object      = <ls_refobj_new>-short_text.
+        <ls_refobj_old>-ib_instance      = <ls_refobj_new>-instance.
+
+*     Update FB entity
+        CALL FUNCTION 'CRM_REFOBJ_CHANGE_OW'
+          EXPORTING
+            iv_guid_set          = <ls_fb>-guid_set
+            iv_kind_hi           = 'A'
+            is_refobj_wrk        = <ls_refobj_old>
+          CHANGING
+            ct_input_field_names = lt_input_field_names[]
+          EXCEPTIONS
+            error_occurred       = 1
+            OTHERS               = 2.
+        IF sy-subrc <> 0.
+* Implement suitable error handling here
+        ENDIF.
+
+        INSERT CONV #( <ls_fb>-fb_guid ) INTO TABLE lt_objects_to_save.
+      ENDLOOP.
+    ENDLOOP.
+
+
+    IF lt_objects_to_save[] IS INITIAL.
+      RETURN.
+    ENDIF.
+
+
+
+*--------------------------------------------------------------------*
+* Save changes in Focused Build entities
+*--------------------------------------------------------------------*
+    DATA(lt_saved)           = VALUE crmt_return_objects( ).
+    DATA(lt_save_errors)     = VALUE crmt_exception_t( ).
+    DATA(lt_not_saved)       = VALUE crmt_object_guid_tab( ).
+
+    CALL FUNCTION 'CRM_ORDER_SAVE'
+      EXPORTING
+        it_objects_to_save   = lt_objects_to_save
+      IMPORTING
+        et_saved_objects     = lt_saved
+        et_exception         = lt_save_errors
+        et_objects_not_saved = lt_not_saved
+      EXCEPTIONS
+        document_not_saved   = 1
+        OTHERS               = 2.
+    DATA(lv_subrc) = sy-subrc.
+
+    IF lv_subrc <> 0.
+***    ev_result = sy-subrc.
+      EXIT.
+    ELSE.
+      COMMIT WORK AND WAIT.
+      CALL FUNCTION 'CRM_ORDER_DEQUEUE'
+        EXPORTING
+          iv_guid = <ls_fb>-fb_guid.
+    ENDIF.
+
+* initialize all buffers of 1Order
+    CALL FUNCTION 'CRM_ORDER_INITIALIZE'
+      EXPORTING
+        iv_initialize_whole_buffer = abap_true
+      EXCEPTIONS
+        error_occurred             = 1
+        OTHERS                     = 2.
+
+
+
+*--------------------------------------------------------------------*
+* Report Outcome
+*--------------------------------------------------------------------*
+    WRITE / |-----------------------------------------------------------|.
+    WRITE / |{ lines( lt_saved ) } objects saved:|.
+    WRITE / |-----------------------------------------------------------|.
+    LOOP AT lt_saved ASSIGNING FIELD-SYMBOL(<ls_saved>).
+      WRITE / |Object ID { <ls_saved>-object_id  }, GUID { <ls_saved>-guid }|.
+    ENDLOOP.
+    WRITE / ||.
+    WRITE / |-----------------------------------------------------------|.
+    WRITE / |{ lines( lt_save_errors ) } objects with exceptions:|.
+    WRITE / |-----------------------------------------------------------|.
+    LOOP AT lt_save_errors ASSIGNING FIELD-SYMBOL(<ls_save_errors>).
+      WRITE / |Class { <ls_save_errors>-class  }, Code { <ls_save_errors>-code }|.
+*    WRITE / |Class { <ls_save_errors>-class  }, Code { <ls_save_errors>-code }, Message Handle { <ls_save_errors>-msg_handle }|.
+    ENDLOOP.
+    WRITE / ||.
+    WRITE / |-----------------------------------------------------------|.
+    WRITE / |{ lines( lt_save_errors ) } objects not saved:|.
+    WRITE / |-----------------------------------------------------------|.
+    LOOP AT lt_not_saved ASSIGNING FIELD-SYMBOL(<lv_not_saved>).
+      WRITE / |GUID { <lv_not_saved> }|.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+ENDCLASS.
