@@ -1,0 +1,10 @@
+*&---------------------------------------------------------------------*
+*&  Include           YOAV_CHG_WI_CNFG_ITM_SCR
+*&---------------------------------------------------------------------*
+
+  TABLES: zfbi_wi.
+*SELECT-OPTIONS: s_id   FOR zfbi_wi-wi_id DEFAULT '3000003757'.
+*SELECT-OPTIONS: s_id   FOR zfbi_wi-wi_id DEFAULT '3000003753'.
+  SELECT-OPTIONS: s_id   FOR zfbi_wi-wi_id DEFAULT '2000002131'.
+*SELECT-OPTIONS: s_id   FOR zfbi_wi-wi_id DEFAULT '2000001149'.
+*SELECT-OPTIONS: s_id   FOR zfbi_wi-wi_id DEFAULT '3000003751'.
